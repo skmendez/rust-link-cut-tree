@@ -1,11 +1,12 @@
 use crate::splay_forest::{SplayForest, NodeIdx};
+use crate::aggregate::Aggregate;
 use std::fmt::Debug;
 
-pub struct LinkCutTree<V> {
-    rep: SplayForest<V>,
+pub struct LinkCutTree<V, A: Aggregate<V> = ()> {
+    rep: SplayForest<V, A>,
 }
 
-impl<V: Debug> LinkCutTree<V> {
+impl<V: Debug, A: Aggregate<V>> LinkCutTree<V, A> {
     pub fn new() -> Self {
         LinkCutTree { rep: SplayForest::new() }
     }
@@ -52,11 +53,28 @@ impl<V: Debug> LinkCutTree<V> {
     pub fn get_val(&mut self, node_idx: NodeIdx) -> &V {
         self.rep.get_value(node_idx)
     }
+
+    pub fn set_val(&mut self, node_idx: NodeIdx, val: V) {
+        self.rep.set_value(node_idx, val);
+    }
+
+    /// Returns the aggregate of the values on the path from the root of
+    /// `node_idx`'s tree down to `node_idx`, inclusive.
+    ///
+    /// After `access`, the node's auxiliary tree contains exactly the nodes
+    /// on the root-to-node path, so the subtree aggregate at its root is the
+    /// path aggregate.
+    pub fn path_aggregate(&mut self, node_idx: NodeIdx) -> A {
+        self.access(node_idx);
+        self.rep.get_aggregate(node_idx).clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::link_cut_tree::LinkCutTree;
+    use crate::aggregate::{Aggregate, Sum, Max};
+    use crate::splay_forest::NodeIdx;
 
     #[test]
     fn basic_tree() {
@@ -154,6 +172,206 @@ mod tests {
         lct.cut(node2);
         assert_eq!(lct.find_root(node1), node1, "should still be its own root");
         assert_eq!(lct.find_root(node2), node2, "should be back to being its own root");
+    }
+
+    #[test]
+    fn path_sum_chain() {
+        let mut lct: LinkCutTree<i64, Sum<i64>> = LinkCutTree::new();
+        let nodes = (0..100).map(|i| lct.make_tree(i)).collect::<Vec<_>>();
+        for pair in nodes.windows(2) {
+            lct.link(pair[0], pair[1]);
+        }
+        for (i, node) in nodes.iter().enumerate() {
+            let expected: i64 = (0..=i as i64).sum();
+            assert_eq!(lct.path_aggregate(*node), Sum(expected), "wrong sum at depth {}", i);
+        }
+    }
+
+    #[test]
+    fn path_sum_branching() {
+        // 1 -> 2 -> 4 and 1 -> 3 -> 5
+        let mut lct: LinkCutTree<i64, Sum<i64>> = LinkCutTree::new();
+        let n1 = lct.make_tree(1);
+        let n2 = lct.make_tree(2);
+        let n3 = lct.make_tree(3);
+        let n4 = lct.make_tree(4);
+        let n5 = lct.make_tree(5);
+        lct.link(n1, n2);
+        lct.link(n1, n3);
+        lct.link(n2, n4);
+        lct.link(n3, n5);
+        assert_eq!(lct.path_aggregate(n4), Sum(1 + 2 + 4));
+        assert_eq!(lct.path_aggregate(n5), Sum(1 + 3 + 5));
+        assert_eq!(lct.path_aggregate(n1), Sum(1));
+    }
+
+    #[test]
+    fn path_sum_after_cut_and_relink() {
+        let mut lct: LinkCutTree<i64, Sum<i64>> = LinkCutTree::new();
+        let n1 = lct.make_tree(1);
+        let n2 = lct.make_tree(2);
+        let n3 = lct.make_tree(3);
+        lct.link(n1, n2);
+        lct.link(n2, n3);
+        assert_eq!(lct.path_aggregate(n3), Sum(6));
+
+        lct.cut(n2);
+        assert_eq!(lct.path_aggregate(n3), Sum(5), "cut subtree should keep only its own path");
+        assert_eq!(lct.path_aggregate(n1), Sum(1), "remaining tree should exclude cut subtree");
+
+        lct.link(n3, n1);
+        assert_eq!(lct.path_aggregate(n1), Sum(2 + 3 + 1), "relinked path should aggregate through new root");
+    }
+
+    #[test]
+    fn path_sum_after_set_val() {
+        let mut lct: LinkCutTree<i64, Sum<i64>> = LinkCutTree::new();
+        let n1 = lct.make_tree(1);
+        let n2 = lct.make_tree(2);
+        lct.link(n1, n2);
+        assert_eq!(lct.path_aggregate(n2), Sum(3));
+        lct.set_val(n1, 10);
+        assert_eq!(lct.path_aggregate(n2), Sum(12));
+    }
+
+    #[test]
+    fn path_max() {
+        let mut lct: LinkCutTree<i64, Max<i64>> = LinkCutTree::new();
+        let n1 = lct.make_tree(7);
+        let n2 = lct.make_tree(3);
+        let n3 = lct.make_tree(9);
+        lct.link(n1, n2);
+        lct.link(n2, n3);
+        assert_eq!(lct.path_aggregate(n1), Max(7));
+        assert_eq!(lct.path_aggregate(n2), Max(7));
+        assert_eq!(lct.path_aggregate(n3), Max(9));
+    }
+
+    /// A non-commutative aggregation: concatenating path values in
+    /// root-to-node order. Verifies that `combine` always sees the shallower
+    /// segment as `upper`, regardless of how the splay trees are shaped.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PathConcat(String);
+
+    impl Aggregate<&str> for PathConcat {
+        fn from_value(value: &&str) -> Self {
+            PathConcat(value.to_string())
+        }
+
+        fn combine(upper: &Self, lower: &Self) -> Self {
+            PathConcat(format!("{}{}", upper.0, lower.0))
+        }
+    }
+
+    #[test]
+    fn path_concat_is_ordered_root_to_node() {
+        let mut lct: LinkCutTree<&str, PathConcat> = LinkCutTree::new();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let nodes = names.iter().map(|name| lct.make_tree(*name)).collect::<Vec<_>>();
+        for pair in nodes.windows(2) {
+            lct.link(pair[0], pair[1]);
+        }
+        // Query out of order to force plenty of splay restructuring.
+        assert_eq!(lct.path_aggregate(nodes[3]), PathConcat("abcd".into()));
+        assert_eq!(lct.path_aggregate(nodes[5]), PathConcat("abcdef".into()));
+        assert_eq!(lct.path_aggregate(nodes[1]), PathConcat("ab".into()));
+        assert_eq!(lct.path_aggregate(nodes[4]), PathConcat("abcde".into()));
+        assert_eq!(lct.path_aggregate(nodes[0]), PathConcat("a".into()));
+    }
+
+    /// A trivially correct forest with parent pointers, used as a reference
+    /// implementation for the randomized test below.
+    struct NaiveForest {
+        parent: Vec<Option<usize>>,
+        values: Vec<i64>,
+    }
+
+    impl NaiveForest {
+        fn find_root(&self, mut v: usize) -> usize {
+            while let Some(p) = self.parent[v] {
+                v = p;
+            }
+            v
+        }
+
+        fn path_sum(&self, v: usize) -> i64 {
+            let mut sum = self.values[v];
+            let mut cur = v;
+            while let Some(p) = self.parent[cur] {
+                sum += self.values[p];
+                cur = p;
+            }
+            sum
+        }
+    }
+
+    /// Deterministic PRNG (xorshift) so the test is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, bound: usize) -> usize {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn randomized_against_naive() {
+        const N: usize = 50;
+        const OPS: usize = 2000;
+
+        let mut rng = Rng(0x853c49e6748fea9b);
+        let mut lct: LinkCutTree<i64, Sum<i64>> = LinkCutTree::new();
+        let mut naive = NaiveForest { parent: vec![None; N], values: Vec::new() };
+        let mut nodes = Vec::new();
+        for i in 0..N {
+            let val = (i as i64) * 31 % 97 - 40;
+            nodes.push(lct.make_tree(val));
+            naive.values.push(val);
+        }
+
+        for op in 0..OPS {
+            match rng.next(4) {
+                0 => {
+                    // Link a root of one tree under a node of a different tree.
+                    let child = rng.next(N);
+                    let parent = rng.next(N);
+                    if naive.parent[child].is_none()
+                        && naive.find_root(parent) != child {
+                        lct.link(nodes[parent], nodes[child]);
+                        naive.parent[child] = Some(parent);
+                    }
+                }
+                1 => {
+                    // Cut a non-root node from its parent.
+                    let v = rng.next(N);
+                    if naive.parent[v].is_some() {
+                        lct.cut(nodes[v]);
+                        naive.parent[v] = None;
+                    }
+                }
+                2 => {
+                    let v = rng.next(N);
+                    assert_eq!(
+                        lct.find_root(nodes[v]),
+                        NodeIdx::new(naive.find_root(v)),
+                        "find_root mismatch at op {}", op
+                    );
+                }
+                _ => {
+                    let v = rng.next(N);
+                    assert_eq!(
+                        lct.path_aggregate(nodes[v]),
+                        Sum(naive.path_sum(v)),
+                        "path sum mismatch for node {} at op {}", v, op
+                    );
+                }
+            }
+        }
     }
 
     #[test]

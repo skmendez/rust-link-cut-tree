@@ -1,6 +1,4 @@
-use crate::splay_forest::SplayForest;
-
-mod splay_forest;
+use link_cut_tree::splay_forest::SplayForest;
 
 fn main() {
     let mut lct: SplayForest<&str> = SplayForest::new();
