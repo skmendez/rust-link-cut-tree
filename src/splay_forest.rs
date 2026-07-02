@@ -3,35 +3,16 @@ use std::convert::TryFrom;
 use std::fmt::{Debug, Formatter};
 use std::fmt;
 use std::collections::HashSet;
-
-pub trait SliceExt {
-    type Item;
-
-    fn get_two_mut(&mut self, index0: usize, index1: usize) -> (&mut Self::Item, &mut Self::Item);
-}
-
-impl<T> SliceExt for [T] {
-    type Item = T;
-
-    fn get_two_mut(&mut self, a: usize, b: usize) -> (&mut Self::Item, &mut Self::Item) {
-        assert_ne!(a, b);
-        assert!(a <= self.len());
-        assert!(b <= self.len());
-        // safe because a, b are in bounds and distinct
-        unsafe {
-            let ar = &mut *(self.get_unchecked_mut(a) as *mut _);
-            let br = &mut *(self.get_unchecked_mut(b) as *mut _);
-            (ar, br)
-        }
-    }
-}
+use crate::aggregate::Aggregate;
 
 #[derive(PartialEq, Eq, Copy, Clone, Hash, Debug)]
 pub struct NodeIdx(NonZeroUsize);
 
 impl NodeIdx {
+    // Crate-private so callers can't fabricate indices; valid ones only come
+    // from `add_node`.
     #[inline]
-    pub fn new(idx: usize) -> Self {
+    pub(crate) fn new(idx: usize) -> Self {
         NodeIdx(NonZeroUsize::try_from(idx + 1).unwrap())
     }
 
@@ -41,28 +22,24 @@ impl NodeIdx {
     }
 }
 
-impl From<usize> for NodeIdx {
-    fn from(idx: usize) -> Self {
-        NodeIdx::new(idx)
-    }
-}
-
 #[derive(Debug)]
-pub struct Node<V> {
+pub struct Node<V, A> {
     value: V,
+    /// Aggregate over this node's splay subtree, i.e. over a contiguous
+    /// segment of the preferred path this auxiliary tree represents.
+    agg: A,
     path_parent: Option<NodeIdx>,
     parent: Option<NodeIdx>,
     left: Option<NodeIdx>,
     right: Option<NodeIdx>,
-    my_idx: NodeIdx
 }
 
-struct NodeDebug<'a, V> {
-    forest: &'a SplayForest<V>,
+struct NodeDebug<'a, V, A: Aggregate<V>> {
+    forest: &'a SplayForest<V, A>,
     idx: Option<NodeIdx>
 }
 
-impl<'a, V: Debug> Debug for NodeDebug<'a, V> {
+impl<'a, V: Debug, A: Aggregate<V>> Debug for NodeDebug<'a, V, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.idx {
             None => {
@@ -88,38 +65,67 @@ impl<'a, V: Debug> Debug for NodeDebug<'a, V> {
     }
 }
 
-impl<V> Node<V> {
-    pub fn new(value: V, cur_idx: NodeIdx) -> Self {
-        Node {  value, path_parent: None, parent: None, left: None, right: None, my_idx: cur_idx }
+impl<V, A: Aggregate<V>> Node<V, A> {
+    pub fn new(value: V) -> Self {
+        let agg = A::from_value(&value);
+        Node {  value, agg, path_parent: None, parent: None, left: None, right: None }
     }
 }
 
-pub struct SplayForest<V> {
-    pub forest: Vec<Node<V>>
+pub struct SplayForest<V, A: Aggregate<V> = ()> {
+    pub forest: Vec<Node<V, A>>
 }
 
-impl<V> SplayForest<V> {
+impl<V, A: Aggregate<V>> SplayForest<V, A> {
     pub fn new() -> Self {
         SplayForest { forest: Vec::new(), }
     }
 
     pub fn add_node(&mut self, node: V) -> NodeIdx {
-        let cur_idx = self.forest.len().into();
-        let node = Node::new(node, cur_idx);
-        self.forest.push(node);
+        let cur_idx = NodeIdx::new(self.forest.len());
+        self.forest.push(Node::new(node));
         cur_idx
     }
 
-    fn get_node(&self, node_idx: NodeIdx) -> &Node<V> {
+    fn get_node(&self, node_idx: NodeIdx) -> &Node<V, A> {
         &self.forest[node_idx.get()]
     }
 
-    fn get_node_mut(&mut self, node_idx: NodeIdx) -> &mut Node<V> {
+    fn get_node_mut(&mut self, node_idx: NodeIdx) -> &mut Node<V, A> {
         &mut self.forest[node_idx.get()]
     }
 
     pub fn get_value(&self, node_idx: NodeIdx) -> &V {
         &self.get_node(node_idx).value
+    }
+
+    /// Returns the aggregate over this node's entire splay subtree. After an
+    /// access, the accessed node is the root of its auxiliary tree, so its
+    /// aggregate covers the whole preferred path (root-to-node path).
+    pub fn get_aggregate(&self, node_idx: NodeIdx) -> &A {
+        &self.get_node(node_idx).agg
+    }
+
+    /// Replaces a node's value, restoring the aggregate invariant. Splays
+    /// first so the node has no ancestors whose aggregates would go stale.
+    pub fn set_value(&mut self, node_idx: NodeIdx, value: V) {
+        self.splay(node_idx);
+        self.get_node_mut(node_idx).value = value;
+        self.update_aggregate(node_idx);
+    }
+
+    /// Recomputes this node's aggregate from its value and its children's
+    /// aggregates. Children must already satisfy the aggregate invariant.
+    fn update_aggregate(&mut self, node_idx: NodeIdx) {
+        let node = self.get_node(node_idx);
+        let mut agg = A::from_value(&node.value);
+        if let Some(left_idx) = node.left {
+            agg = A::combine(&self.get_node(left_idx).agg, &agg);
+        }
+        if let Some(right_idx) = node.right {
+            agg = A::combine(&agg, &self.get_node(right_idx).agg);
+        }
+        self.get_node_mut(node_idx).agg = agg;
     }
 
     pub fn get_parent(&self, node_idx: NodeIdx) -> Option<NodeIdx> {
@@ -202,6 +208,10 @@ impl<V> SplayForest<V> {
                 self.set_left(root_idx, self.get_node(new_root_idx).right);
                 self.update_parent(root_idx, new_root_idx);
                 self.set_right(new_root_idx, Some(root_idx));
+                // A rotation permutes nodes within this subtree, so only the
+                // two rotated nodes need recomputing, bottom-up.
+                self.update_aggregate(root_idx);
+                self.update_aggregate(new_root_idx);
             }
         }
     }
@@ -214,6 +224,8 @@ impl<V> SplayForest<V> {
                 self.set_right(root_idx, self.get_node(new_root_idx).left);
                 self.update_parent(root_idx, new_root_idx);
                 self.set_left(new_root_idx, Some(root_idx));
+                self.update_aggregate(root_idx);
+                self.update_aggregate(new_root_idx);
             }
         }
     }
@@ -234,6 +246,7 @@ impl<V> SplayForest<V> {
         }
     }
 
+    #[cfg(test)]
     fn rotate_down(&mut self, node_idx: NodeIdx) {
         if self.get_node(node_idx).left.is_some() {
             self.rotate_right(node_idx);
@@ -242,6 +255,8 @@ impl<V> SplayForest<V> {
         }
     }
 
+    /// Raw pointer surgery; does not maintain aggregates. Callers that change
+    /// tree structure must restore the invariant with `update_aggregate`.
     pub fn set_right(&mut self, node_idx: NodeIdx, right_idx: Option<NodeIdx>) {
         self.forest[node_idx.get()].right = right_idx;
         match right_idx {
@@ -253,6 +268,8 @@ impl<V> SplayForest<V> {
 
     }
 
+    /// Raw pointer surgery; does not maintain aggregates. Callers that change
+    /// tree structure must restore the invariant with `update_aggregate`.
     pub fn set_left(&mut self, node_idx: NodeIdx, left_idx: Option<NodeIdx>) {
         self.forest[node_idx.get()].left = left_idx;
         match left_idx {
@@ -308,12 +325,17 @@ impl<V> SplayForest<V> {
             new_right.parent = node_idx.into();
             new_right.path_parent = None;
         }
+        // The detached subtree keeps its aggregate; the node's own aggregate
+        // must reflect its new right child. It is an auxiliary tree root, so
+        // no ancestors need updating.
+        self.update_aggregate(node_idx);
     }
 
     pub fn split_left(&mut self, node_idx: NodeIdx) {
         if let Some(left_idx) = self.get_left(node_idx) {
             self.get_node_mut(left_idx).parent = None;
             self.get_node_mut(node_idx).left = None;
+            self.update_aggregate(node_idx);
         }
     }
 
@@ -321,10 +343,11 @@ impl<V> SplayForest<V> {
         assert_eq!(self.get_node_mut(node_idx).left, None);
         self.get_node_mut(node_idx).left = left_idx.into();
         self.get_node_mut(left_idx).parent = node_idx.into();
+        self.update_aggregate(node_idx);
     }
 }
 
-impl<V: Debug> Debug for SplayForest<V> {
+impl<V: Debug, A: Aggregate<V>> Debug for SplayForest<V, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut roots = HashSet::new();
         for i in 0..self.forest.len() {
