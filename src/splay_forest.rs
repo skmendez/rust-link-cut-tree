@@ -5,46 +5,20 @@ use std::fmt;
 use std::collections::HashSet;
 use crate::aggregate::Aggregate;
 
-pub trait SliceExt {
-    type Item;
-
-    fn get_two_mut(&mut self, index0: usize, index1: usize) -> (&mut Self::Item, &mut Self::Item);
-}
-
-impl<T> SliceExt for [T] {
-    type Item = T;
-
-    fn get_two_mut(&mut self, a: usize, b: usize) -> (&mut Self::Item, &mut Self::Item) {
-        assert_ne!(a, b);
-        assert!(a <= self.len());
-        assert!(b <= self.len());
-        // safe because a, b are in bounds and distinct
-        unsafe {
-            let ar = &mut *(self.get_unchecked_mut(a) as *mut _);
-            let br = &mut *(self.get_unchecked_mut(b) as *mut _);
-            (ar, br)
-        }
-    }
-}
-
 #[derive(PartialEq, Eq, Copy, Clone, Hash, Debug)]
 pub struct NodeIdx(NonZeroUsize);
 
 impl NodeIdx {
+    // Crate-private so callers can't fabricate indices; valid ones only come
+    // from `add_node`.
     #[inline]
-    pub fn new(idx: usize) -> Self {
+    pub(crate) fn new(idx: usize) -> Self {
         NodeIdx(NonZeroUsize::try_from(idx + 1).unwrap())
     }
 
     #[inline]
     fn get(self) -> usize {
         self.0.get() - 1
-    }
-}
-
-impl From<usize> for NodeIdx {
-    fn from(idx: usize) -> Self {
-        NodeIdx::new(idx)
     }
 }
 
@@ -58,7 +32,6 @@ pub struct Node<V, A> {
     parent: Option<NodeIdx>,
     left: Option<NodeIdx>,
     right: Option<NodeIdx>,
-    my_idx: NodeIdx
 }
 
 struct NodeDebug<'a, V, A: Aggregate<V>> {
@@ -93,9 +66,9 @@ impl<'a, V: Debug, A: Aggregate<V>> Debug for NodeDebug<'a, V, A> {
 }
 
 impl<V, A: Aggregate<V>> Node<V, A> {
-    pub fn new(value: V, cur_idx: NodeIdx) -> Self {
+    pub fn new(value: V) -> Self {
         let agg = A::from_value(&value);
-        Node {  value, agg, path_parent: None, parent: None, left: None, right: None, my_idx: cur_idx }
+        Node {  value, agg, path_parent: None, parent: None, left: None, right: None }
     }
 }
 
@@ -109,9 +82,8 @@ impl<V, A: Aggregate<V>> SplayForest<V, A> {
     }
 
     pub fn add_node(&mut self, node: V) -> NodeIdx {
-        let cur_idx = self.forest.len().into();
-        let node = Node::new(node, cur_idx);
-        self.forest.push(node);
+        let cur_idx = NodeIdx::new(self.forest.len());
+        self.forest.push(Node::new(node));
         cur_idx
     }
 
@@ -274,6 +246,7 @@ impl<V, A: Aggregate<V>> SplayForest<V, A> {
         }
     }
 
+    #[cfg(test)]
     fn rotate_down(&mut self, node_idx: NodeIdx) {
         if self.get_node(node_idx).left.is_some() {
             self.rotate_right(node_idx);

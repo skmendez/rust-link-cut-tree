@@ -39,12 +39,19 @@ impl<V: Debug, A: Aggregate<V>> LinkCutTree<V, A> {
         return root;
     }
 
-    pub fn cut(&mut self, node_idx: NodeIdx) {
+    /// Detaches `node_idx` from its parent. Returns false if it was already
+    /// the root of its tree.
+    pub fn cut(&mut self, node_idx: NodeIdx) -> bool {
         self.access(node_idx);
+        let had_parent = self.rep.get_left(node_idx).is_some();
         self.rep.split_left(node_idx);
+        had_parent
     }
 
+    /// Makes `child_idx` a child of `parent_idx`. `child_idx` must be the
+    /// root of a tree not containing `parent_idx`.
     pub fn link(&mut self, parent_idx: NodeIdx, child_idx: NodeIdx) {
+        assert_ne!(self.find_root(parent_idx), child_idx, "link would create a cycle");
         self.access(child_idx);
         self.access(parent_idx);
         self.rep.join_left(child_idx, parent_idx);
@@ -169,9 +176,40 @@ mod tests {
         lct.link(node1, node2);
         assert_eq!(lct.find_root(node1), node1, "original root changed");
         assert_eq!(lct.find_root(node2), node1, "new root not updated");
-        lct.cut(node2);
+        assert!(lct.cut(node2), "cut of a non-root should report success");
         assert_eq!(lct.find_root(node1), node1, "should still be its own root");
         assert_eq!(lct.find_root(node2), node2, "should be back to being its own root");
+    }
+
+    #[test]
+    fn cut_root_is_noop() {
+        let mut lct: LinkCutTree<&str> = LinkCutTree::new();
+        let node1 = lct.make_tree("1");
+        let node2 = lct.make_tree("2");
+        lct.link(node1, node2);
+        assert!(!lct.cut(node1), "cutting a root should report failure");
+        assert_eq!(lct.find_root(node2), node1, "tree should be unchanged");
+    }
+
+    #[test]
+    #[should_panic(expected = "link would create a cycle")]
+    fn link_within_same_tree_panics() {
+        let mut lct: LinkCutTree<&str> = LinkCutTree::new();
+        let node1 = lct.make_tree("1");
+        let node2 = lct.make_tree("2");
+        lct.link(node1, node2);
+        lct.link(node2, node1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn link_non_root_child_panics() {
+        let mut lct: LinkCutTree<&str> = LinkCutTree::new();
+        let node1 = lct.make_tree("1");
+        let node2 = lct.make_tree("2");
+        let node3 = lct.make_tree("3");
+        lct.link(node1, node2);
+        lct.link(node3, node2);
     }
 
     #[test]
@@ -386,7 +424,7 @@ mod tests {
         }
 
         for child in &children {
-            lct.cut(*child)
+            lct.cut(*child);
         }
 
         for child in &children {

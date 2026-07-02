@@ -5,12 +5,3 @@ version = 4
 [[package]]
 name = "link-cut-tree"
 version = "0.1.0"
-dependencies = [
- "splay",
-]
-
-[[package]]
-name = "splay"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990199a6564fd13d4707cb8ecdee537b969dede4abec98459353b93a81d7e8cd"
